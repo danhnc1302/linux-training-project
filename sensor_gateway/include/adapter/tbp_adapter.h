@@ -1,8 +1,8 @@
-#include <stdint.h>
+#ifndef TBP_ADAPTER_H
+#define TBP_ADAPTER_H
 
-typedef struct
-{
-    uint16_t sensor_id;
-    double value;
-    uint64_t timestamp;
-} __attribute__((packed)) tbp_frame_t;
+#include "protocol_adapter.h"
+
+extern const protocol_adapter_t g_tbp_adapter;
+
+#endif

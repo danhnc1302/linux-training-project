@@ -1,17 +1,14 @@
-CC      = gcc
-CFLAGS  = -Wall -Wextra -g
+CC     = gcc
+CFLAGS = -Wall -Wextra -g
 
-TARGET  = sensor_node
-SRC     = sensor_node.c
-OBJ     = $(SRC:.c=.o)
+TARGET = sensor_node
 
 all: $(TARGET)
 
-$(TARGET): $(OBJ)
-	$(CC) $(OBJ) -o $@
+$(TARGET): sensor_node.c
+	$(CC) $(CFLAGS) $< -o $@
 
 clean:
-	rm -f $(OBJ)
 	rm -f $(TARGET)
 
 .PHONY: all clean

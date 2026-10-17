@@ -1,256 +1,253 @@
 #include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
+
 #include "sbuffer.h"
 
-static void remove_node_if_done(
-        sbuffer_t *buffer,
-        sbuffer_node_t *prev,
-        sbuffer_node_t *node)
+/* Remove node from the list if both readers are done.
+ * Caller holds buffer->mutex. */
+static void remove_if_done(sbuffer_t *b, sbuffer_node_t *prev,
+                           sbuffer_node_t *node)
 {
-    printf("[CHECK DELETE] seq=%lu data=%d store=%d\n",
-       node->data.seq,
-       node->read_by_datamgr,
-       node->read_by_storagemgr);
-
-    if (!node->read_by_datamgr ||
-        !node->read_by_storagemgr)
+    if (!node->read_by_datamgr || !node->read_by_storagemgr)
     {
         return;
     }
 
-    printf("[DELETE] seq=%lu\n",
-           node->data.seq);
-
     if (prev == NULL)
     {
-        buffer->head = node->next;
+        b->head = node->next;
     }
     else
     {
         prev->next = node->next;
     }
 
-    if (buffer->tail == node)
+    if (b->tail == node)
     {
-        buffer->tail = prev;
+        b->tail = prev;
     }
 
+    b->size--;
     free(node);
+}
+
+/* Find first node not yet read by the given reader. Caller holds mutex. */
+static sbuffer_node_t *find_unread(sbuffer_t *b, bool storage,
+                                   sbuffer_node_t **prev_out)
+{
+    sbuffer_node_t *prev = NULL;
+    sbuffer_node_t *curr = b->head;
+
+    while (curr != NULL)
+    {
+        bool done = storage ? curr->read_by_storagemgr : curr->read_by_datamgr;
+
+        if (!done)
+        {
+            *prev_out = prev;
+            return curr;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    *prev_out = NULL;
+    return NULL;
+}
+
+/* Block until an unread node exists. Return it, or NULL after shutdown.
+ * Caller holds mutex. */
+static sbuffer_node_t *wait_unread(sbuffer_t *b, bool storage,
+                                   sbuffer_node_t **prev_out)
+{
+    for (;;)
+    {
+        sbuffer_node_t *node = find_unread(b, storage, prev_out);
+
+        if (node != NULL)
+        {
+            return node;
+        }
+        if (b->shutdown)
+        {
+            return NULL;
+        }
+        pthread_cond_wait(&b->cond, &b->mutex);
+    }
 }
 
 int sbuffer_init(sbuffer_t **buffer)
 {
-    *buffer = malloc(sizeof(sbuffer_t));
+    sbuffer_t *b;
 
-    if (*buffer == NULL)
+    if (buffer == NULL)
     {
         return SBUFFER_FAILURE;
     }
 
-    (*buffer)->head = NULL;
-    (*buffer)->tail = NULL;
-    (*buffer)->shutdown = false;
+    b = calloc(1, sizeof(*b));
+    if (b == NULL)
+    {
+        return SBUFFER_FAILURE;
+    }
 
-    pthread_mutex_init(&(*buffer)->mutex, NULL);
-    pthread_cond_init(&(*buffer)->cond, NULL);
+    pthread_mutex_init(&b->mutex, NULL);
+    pthread_cond_init(&b->cond, NULL);
 
+    *buffer = b;
     return SBUFFER_SUCCESS;
 }
 
-int sbuffer_insert(
-        sbuffer_t *buffer,
-        const sensor_data_t *data)
+void sbuffer_free(sbuffer_t **buffer)
 {
+    sbuffer_node_t *curr;
 
-    printf("[INSERT] seq=%lu id=%u temp=%.2f ts=%ld\n",
-       data->seq,
-       data->sensor_id,
-       data->value,
-       data->timestamp);
+    if (buffer == NULL || *buffer == NULL)
+    {
+        return;
+    }
+
+    curr = (*buffer)->head;
+    while (curr != NULL)
+    {
+        sbuffer_node_t *next = curr->next;
+
+        free(curr);
+        curr = next;
+    }
+
+    pthread_mutex_destroy(&(*buffer)->mutex);
+    pthread_cond_destroy(&(*buffer)->cond);
+    free(*buffer);
+    *buffer = NULL;
+}
+
+int sbuffer_insert(sbuffer_t *buffer, const sensor_data_t *data)
+{
+    sbuffer_node_t *node;
 
     if (buffer == NULL || data == NULL)
     {
         return SBUFFER_FAILURE;
     }
 
-    sbuffer_node_t *node =
-        malloc(sizeof(sbuffer_node_t));
-
+    node = calloc(1, sizeof(*node));      /* malloc outside the lock */
     if (node == NULL)
     {
         return SBUFFER_FAILURE;
     }
-
     node->data = *data;
-    node->read_by_datamgr = false;
-    node->read_by_storagemgr = false;
-    node->next = NULL;
 
     pthread_mutex_lock(&buffer->mutex);
 
     if (buffer->tail == NULL)
     {
         buffer->head = node;
-        buffer->tail = node;
     }
     else
     {
         buffer->tail->next = node;
-        buffer->tail = node;
     }
+    buffer->tail = node;
+    buffer->size++;
 
     pthread_cond_broadcast(&buffer->cond);
-
     pthread_mutex_unlock(&buffer->mutex);
 
     return SBUFFER_SUCCESS;
 }
 
-int sbuffer_read_datamgr(
-        sbuffer_t *buffer,
-        sensor_data_t *data)
+int sbuffer_read_datamgr(sbuffer_t *buffer, sensor_data_t *data)
 {
+    sbuffer_node_t *prev;
+    sbuffer_node_t *node;
+
     pthread_mutex_lock(&buffer->mutex);
 
-    while (1)
+    node = wait_unread(buffer, false, &prev);
+    if (node == NULL)
     {
-        sbuffer_node_t *curr = buffer->head;
-        sbuffer_node_t *prev = NULL;
-
-        while (curr)
-        {
-            if (!curr->read_by_datamgr)
-            {
-                *data = curr->data;
-
-                printf("[DM READ ] seq=%lu d=%d s=%d\n",
-       curr->data.seq,
-       curr->read_by_datamgr,
-       curr->read_by_storagemgr);
-
-                curr->read_by_datamgr = true;
-
-                remove_node_if_done(
-                        buffer,
-                        prev,
-                        curr);
-
-                pthread_mutex_unlock(
-                        &buffer->mutex);
-
-                return SBUFFER_SUCCESS;
-            }
-
-            prev = curr;
-            curr = curr->next;
-        }
-
-        if (buffer->shutdown)
-        {
-            pthread_mutex_unlock(
-                    &buffer->mutex);
-
-            return SBUFFER_NO_DATA;
-        }
-
-        pthread_cond_wait(
-                &buffer->cond,
-                &buffer->mutex);
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_NO_DATA;
     }
+
+    *data = node->data;
+    node->read_by_datamgr = true;
+    remove_if_done(buffer, prev, node);
+
+    pthread_mutex_unlock(&buffer->mutex);
+    return SBUFFER_SUCCESS;
 }
 
-int sbuffer_read_storagemgr(
-        sbuffer_t *buffer,
-        sensor_data_t *data)
+int sbuffer_peek_storagemgr(sbuffer_t *buffer, sensor_data_t *data)
 {
+    sbuffer_node_t *prev;
+    sbuffer_node_t *node;
+
     pthread_mutex_lock(&buffer->mutex);
 
-    while (1)
+    node = wait_unread(buffer, true, &prev);
+    if (node == NULL)
     {
-        sbuffer_node_t *curr = buffer->head;
-        sbuffer_node_t *prev = NULL;
-
-        while (curr)
-        {
-            if (!curr->read_by_storagemgr)
-            {
-                *data = curr->data;
-
-                curr->read_by_storagemgr = true;
-
-                remove_node_if_done(
-                        buffer,
-                        prev,
-                        curr);
-
-                pthread_mutex_unlock(
-                        &buffer->mutex);
-
-                return SBUFFER_SUCCESS;
-            }
-
-            prev = curr;
-            curr = curr->next;
-        }
-
-        if (buffer->shutdown)
-        {
-            pthread_mutex_unlock(
-                    &buffer->mutex);
-
-            return SBUFFER_NO_DATA;
-        }
-
-        pthread_cond_wait(
-                &buffer->cond,
-                &buffer->mutex);
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_NO_DATA;
     }
+
+    *data = node->data;                    /* flag NOT set yet */
+
+    pthread_mutex_unlock(&buffer->mutex);
+    return SBUFFER_SUCCESS;
 }
 
-void sbuffer_shutdown(
-        sbuffer_t *buffer)
+/* Only the Storage manager sets read_by_storagemgr, and nodes are only
+ * appended at the tail, so the first unread node is still the one that
+ * was peeked. It cannot have been freed: its storage flag was false. */
+int sbuffer_commit_storagemgr(sbuffer_t *buffer)
 {
+    sbuffer_node_t *prev;
+    sbuffer_node_t *node;
+
     pthread_mutex_lock(&buffer->mutex);
 
+    node = find_unread(buffer, true, &prev);
+    if (node == NULL)
+    {
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_FAILURE;
+    }
+
+    node->read_by_storagemgr = true;
+    remove_if_done(buffer, prev, node);
+
+    pthread_mutex_unlock(&buffer->mutex);
+    return SBUFFER_SUCCESS;
+}
+
+int sbuffer_read_storagemgr(sbuffer_t *buffer, sensor_data_t *data)
+{
+    int ret = sbuffer_peek_storagemgr(buffer, data);
+
+    if (ret == SBUFFER_SUCCESS)
+    {
+        ret = sbuffer_commit_storagemgr(buffer);
+    }
+    return ret;
+}
+
+void sbuffer_shutdown(sbuffer_t *buffer)
+{
+    pthread_mutex_lock(&buffer->mutex);
     buffer->shutdown = true;
-
-    pthread_cond_broadcast(
-            &buffer->cond);
-
-    pthread_mutex_unlock(
-            &buffer->mutex);
+    pthread_cond_broadcast(&buffer->cond);
+    pthread_mutex_unlock(&buffer->mutex);
 }
 
-void sbuffer_free(
-        sbuffer_t **buffer)
+size_t sbuffer_size(sbuffer_t *buffer)
 {
-    if (buffer == NULL ||
-        *buffer == NULL)
-    {
-        return;
-    }
+    size_t size;
 
-    sbuffer_node_t *curr =
-        (*buffer)->head;
+    pthread_mutex_lock(&buffer->mutex);
+    size = buffer->size;
+    pthread_mutex_unlock(&buffer->mutex);
 
-    while (curr)
-    {
-        sbuffer_node_t *next =
-            curr->next;
-
-        free(curr);
-
-        curr = next;
-    }
-
-    pthread_mutex_destroy(
-            &(*buffer)->mutex);
-
-    pthread_cond_destroy(
-            &(*buffer)->cond);
-
-    free(*buffer);
-
-    *buffer = NULL;
+    return size;
 }
